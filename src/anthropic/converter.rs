@@ -46,7 +46,6 @@ pub struct ConversionResult {
 pub enum ConversionError {
     UnsupportedModel(String),
     EmptyMessages,
-    NoUserMessagesAtEnd,
 }
 
 impl std::fmt::Display for ConversionError {
@@ -54,9 +53,6 @@ impl std::fmt::Display for ConversionError {
         match self {
             ConversionError::UnsupportedModel(model) => write!(f, "模型不支持: {}", model),
             ConversionError::EmptyMessages => write!(f, "消息列表为空"),
-            ConversionError::NoUserMessagesAtEnd => {
-                write!(f, "消息列表末尾没有 user 消息，无法构建 current_message")
-            }
         }
     }
 }
@@ -80,9 +76,10 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
         current_start -= 1;
     }
     let current_user_messages = &req.messages[current_start..];
-    if current_user_messages.is_empty() {
-        return Err(ConversionError::NoUserMessagesAtEnd);
-    }
+    
+    // 2.2 检查是否末尾是 assistant 消息（用于标题生成等场景）
+    let ends_with_assistant = current_user_messages.is_empty() 
+        && req.messages.last().map(|m| m.role == "assistant").unwrap_or(false);
 
     // 3. 生成会话 ID 和代理 ID
     let conversation_id = Uuid::new_v4().to_string();
@@ -92,15 +89,24 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
     let chat_trigger_type = determine_chat_trigger_type(req);
 
     // 5. 处理末尾的 user 消息组作为 current_message
-    let current_refs: Vec<&super::types::Message> = current_user_messages.iter().collect();
-    let merged_current = merge_user_messages(&current_refs, &model_id)?;
-    let text_content = merged_current.user_input_message.content.clone();
-    let images = merged_current.user_input_message.images.clone();
-    let tool_results = merged_current
-        .user_input_message
-        .user_input_message_context
-        .tool_results
-        .clone();
+    let (text_content, images, tool_results) = if ends_with_assistant {
+        // 末尾是 assistant 消息，自动补一个 "continue" 请求
+        // 这种情况通常是 Claude Code 的辅助请求（标题生成、摘要等）
+        tracing::info!("消息末尾是 assistant，自动补充 continue 请求（可能是标题生成等辅助功能）");
+        ("continue".to_string(), Vec::new(), Vec::new())
+    } else {
+        let current_refs: Vec<&super::types::Message> = current_user_messages.iter().collect();
+        let merged_current = merge_user_messages(&current_refs, &model_id)?;
+        (
+            merged_current.user_input_message.content.clone(),
+            merged_current.user_input_message.images.clone(),
+            merged_current
+                .user_input_message
+                .user_input_message_context
+                .tool_results
+                .clone(),
+        )
+    };
 
     // 6. 转换工具定义
     let tools = convert_tools(&req.tools);
@@ -129,10 +135,16 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
     let current_message = CurrentMessage::new(user_input);
 
     // 9. 构建历史消息（排除 current_message 对应的末尾 user 消息组）
+    // 如果末尾是 assistant，则所有消息都作为历史
+    let history_end = if ends_with_assistant {
+        req.messages.len()
+    } else {
+        current_start
+    };
     let history_req = MessagesRequest {
         model: req.model.clone(),
         max_tokens: req.max_tokens,
-        messages: req.messages[..current_start].to_vec(),
+        messages: req.messages[..history_end].to_vec(),
         stream: req.stream,
         system: req.system.clone(),
         tools: req.tools.clone(),

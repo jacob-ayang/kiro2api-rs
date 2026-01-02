@@ -139,10 +139,6 @@ pub async fn post_messages(
                 ConversionError::EmptyMessages => {
                     ("invalid_request_error", "消息列表为空".to_string())
                 }
-                ConversionError::NoUserMessagesAtEnd => (
-                    "invalid_request_error",
-                    "消息列表末尾没有 user 消息，无法构建 current_message".to_string(),
-                ),
             };
             tracing::warn!("请求转换失败: {}", e);
             return (
