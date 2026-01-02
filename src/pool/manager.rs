@@ -6,6 +6,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use crate::http_client::ProxyConfig;
+use crate::kiro::provider::KiroProvider;
 use crate::kiro::token_manager::TokenManager;
 use crate::model::config::Config;
 
@@ -26,6 +27,8 @@ pub struct AccountPool {
     accounts: RwLock<HashMap<String, Account>>,
     /// Token 管理器缓存
     token_managers: RwLock<HashMap<String, Arc<tokio::sync::Mutex<TokenManager>>>>,
+    /// Provider 缓存（每账号一个，避免每请求创建 Client）
+    providers: RwLock<HashMap<String, Arc<KiroProvider>>>,
     /// 选择策略
     strategy: RwLock<SelectionStrategy>,
     /// 轮询索引
@@ -42,12 +45,21 @@ pub struct AccountPool {
     usage_cache: RwLock<HashMap<String, UsageLimits>>,
 }
 
+/// 账号池选择结果
+pub struct SelectedAccount {
+    pub id: String,
+    pub name: String,
+    pub provider: Arc<KiroProvider>,
+}
+
 impl AccountPool {
     /// 创建新的账号池
+    #[allow(dead_code)]
     pub fn new(config: Config, proxy: Option<ProxyConfig>) -> Self {
         Self {
             accounts: RwLock::new(HashMap::new()),
             token_managers: RwLock::new(HashMap::new()),
+            providers: RwLock::new(HashMap::new()),
             strategy: RwLock::new(SelectionStrategy::default()),
             round_robin_index: RwLock::new(0),
             config,
@@ -63,6 +75,7 @@ impl AccountPool {
         Self {
             accounts: RwLock::new(HashMap::new()),
             token_managers: RwLock::new(HashMap::new()),
+            providers: RwLock::new(HashMap::new()),
             strategy: RwLock::new(SelectionStrategy::default()),
             round_robin_index: RwLock::new(0),
             config,
@@ -136,11 +149,19 @@ impl AccountPool {
             self.proxy.clone(),
         );
         
+        let tm = Arc::new(tokio::sync::Mutex::new(token_manager));
+        let provider = Arc::new(KiroProvider::with_shared_token_manager(
+            tm.clone(),
+            self.proxy.clone(),
+        ));
+
         let mut accounts = self.accounts.write().await;
         let mut managers = self.token_managers.write().await;
-        
+        let mut providers = self.providers.write().await;
+
         accounts.insert(id.clone(), account);
-        managers.insert(id, Arc::new(tokio::sync::Mutex::new(token_manager)));
+        managers.insert(id.clone(), tm);
+        providers.insert(id, provider);
         
         Ok(())
     }
@@ -156,13 +177,16 @@ impl AccountPool {
     pub async fn remove_account(&self, id: &str) -> Option<Account> {
         let mut accounts = self.accounts.write().await;
         let mut managers = self.token_managers.write().await;
+        let mut providers = self.providers.write().await;
         
         managers.remove(id);
+        providers.remove(id);
         let removed = accounts.remove(id);
         
         // 保存到文件
         drop(accounts);
         drop(managers);
+        drop(providers);
         if let Err(e) = self.save_to_file().await {
             tracing::warn!("保存账号文件失败: {}", e);
         }
@@ -187,50 +211,86 @@ impl AccountPool {
     }
 
     /// 选择一个可用账号并获取其 TokenManager
-    pub async fn select_account(&self) -> Option<(String, Arc<tokio::sync::Mutex<TokenManager>>)> {
+    pub async fn select_account(&self) -> Option<SelectedAccount> {
         let strategy = *self.strategy.read().await;
-        let mut accounts = self.accounts.write().await;
-        
-        // 获取可用账号列表
-        let available: Vec<&str> = accounts
-            .iter()
-            .filter(|(_, a)| a.is_available())
-            .map(|(id, _)| id.as_str())
-            .collect();
-        
+
+        // 先用读锁快速收集可用账号（避免长时间持有写锁）
+        let available: Vec<(String, u64)> = {
+            let accounts = self.accounts.read().await;
+            accounts
+                .iter()
+                .filter(|(_, a)| a.is_available())
+                .map(|(id, a)| (id.clone(), a.request_count))
+                .collect()
+        };
+
         if available.is_empty() {
             return None;
         }
 
-        // 根据策略选择
-        let selected_id = match strategy {
+        // 根据策略选出候选 id（不持有 accounts 锁）
+        let candidate_id = match strategy {
             SelectionStrategy::RoundRobin => {
                 let mut index = self.round_robin_index.write().await;
-                let id = available[*index % available.len()].to_string();
+                let id = available[*index % available.len()].0.clone();
                 *index = (*index + 1) % available.len();
                 id
             }
             SelectionStrategy::Random => {
                 let idx = fastrand::usize(..available.len());
-                available[idx].to_string()
+                available[idx].0.clone()
             }
-            SelectionStrategy::LeastUsed => {
-                available
-                    .iter()
-                    .min_by_key(|id| accounts.get(**id).map(|a| a.request_count).unwrap_or(u64::MAX))
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| available[0].to_string())
+            SelectionStrategy::LeastUsed => available
+                .iter()
+                .min_by_key(|(_, count)| *count)
+                .map(|(id, _)| id.clone())
+                .unwrap_or_else(|| available[0].0.clone()),
+        };
+
+        // 用写锁记录使用，并最终确认选中的账号
+        let (selected_id, selected_name) = {
+            let mut accounts = self.accounts.write().await;
+
+            if let Some(account) = accounts.get_mut(&candidate_id) {
+                if account.is_available() {
+                    account.record_use();
+                    (candidate_id.clone(), account.name.clone())
+                } else {
+                    // 候选账号在并发下变为不可用，退化为找一个可用账号
+                    let mut picked: Option<(String, String)> = None;
+                    for (id, a) in accounts.iter_mut() {
+                        if a.is_available() {
+                            a.record_use();
+                            picked = Some((id.clone(), a.name.clone()));
+                            break;
+                        }
+                    }
+                    picked?
+                }
+            } else {
+                // 候选账号已被删除，退化为找一个可用账号
+                let mut picked: Option<(String, String)> = None;
+                for (id, a) in accounts.iter_mut() {
+                    if a.is_available() {
+                        a.record_use();
+                        picked = Some((id.clone(), a.name.clone()));
+                        break;
+                    }
+                }
+                picked?
             }
         };
 
-        // 记录使用
-        if let Some(account) = accounts.get_mut(&selected_id) {
-            account.record_use();
-        }
+        let provider = {
+            let providers = self.providers.read().await;
+            providers.get(&selected_id).cloned()?
+        };
 
-        // 获取 TokenManager
-        let managers = self.token_managers.read().await;
-        managers.get(&selected_id).map(|tm| (selected_id, tm.clone()))
+        Some(SelectedAccount {
+            id: selected_id,
+            name: selected_name,
+            provider,
+        })
     }
 
     /// 启用账号

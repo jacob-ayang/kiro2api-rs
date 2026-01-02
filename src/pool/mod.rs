@@ -10,4 +10,4 @@ pub mod usage;
 pub use account::Account;
 pub use manager::{AccountPool, PoolStats};
 pub use strategy::SelectionStrategy;
-pub use usage::{RequestLog, RequestLogger, RequestStats, UsageLimits, check_usage_limits};
+pub use usage::RequestLog;

@@ -5,24 +5,27 @@
 
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONNECTION, CONTENT_TYPE, HOST};
 use reqwest::Client;
+use std::sync::Arc;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::http_client::{build_client, ProxyConfig};
 use crate::kiro::machine_id;
+use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::TokenManager;
 
 /// Kiro API Provider
 ///
 /// 核心组件，负责与 Kiro API 通信
-/// 内部使用 Mutex 管理 TokenManager 状态，支持线程安全的并发访问
+/// 内部使用 Arc<Mutex<_>> 管理 TokenManager 状态，支持线程安全的并发访问
 pub struct KiroProvider {
-    token_manager: Mutex<TokenManager>,
+    token_manager: Arc<Mutex<TokenManager>>,
     client: Client,
 }
 
 impl KiroProvider {
     /// 创建新的 KiroProvider 实例
+    #[allow(dead_code)]
     pub fn new(token_manager: TokenManager) -> Self {
         Self::with_proxy(token_manager, None)
     }
@@ -33,32 +36,51 @@ impl KiroProvider {
             .expect("创建 HTTP 客户端失败");
 
         Self {
-            token_manager: Mutex::new(token_manager),
+            token_manager: Arc::new(Mutex::new(token_manager)),
+            client,
+        }
+    }
+
+    /// 使用共享的 TokenManager 创建 Provider（适用于账号池模式）
+    pub fn with_shared_token_manager(
+        token_manager: Arc<Mutex<TokenManager>>,
+        proxy: Option<ProxyConfig>,
+    ) -> Self {
+        let client = build_client(proxy.as_ref(), 720) // 12 分钟超时
+            .expect("创建 HTTP 客户端失败");
+
+        Self {
+            token_manager,
             client,
         }
     }
 
     /// 获取 API 基础 URL
+    #[allow(dead_code)]
     pub async fn base_url(&self) -> String {
-        let tm = self.token_manager.lock().await;
-        format!(
-            "https://q.{}.amazonaws.com/generateAssistantResponse",
-            tm.config().region
-        )
+        let region = {
+            let tm = self.token_manager.lock().await;
+            tm.config().region.clone()
+        };
+        format!("https://q.{}.amazonaws.com/generateAssistantResponse", region)
     }
 
     /// 获取 API 基础域名
+    #[allow(dead_code)]
     pub async fn base_domain(&self) -> String {
-        let tm = self.token_manager.lock().await;
-        format!("q.{}.amazonaws.com", tm.config().region)
+        let region = {
+            let tm = self.token_manager.lock().await;
+            tm.config().region.clone()
+        };
+        format!("q.{}.amazonaws.com", region)
     }
 
     /// 构建请求头
-    async fn build_headers(&self, token: &str) -> anyhow::Result<HeaderMap> {
-        let tm = self.token_manager.lock().await;
-        let credentials = tm.credentials();
-        let config = tm.config();
-
+    fn build_headers(
+        token: &str,
+        credentials: &KiroCredentials,
+        config: &crate::model::config::Config,
+    ) -> anyhow::Result<HeaderMap> {
         let machine_id = machine_id::generate_from_credentials(credentials, config)
             .ok_or_else(|| anyhow::anyhow!("无法生成 machine_id，请检查凭证配置"))?;
 
@@ -66,7 +88,6 @@ impl KiroProvider {
         let os_name = config.system_version.clone();
         let node_version = config.node_version.clone();
         let base_domain = format!("q.{}.amazonaws.com", config.region);
-        drop(tm); // 释放锁
 
         let x_amz_user_agent = format!("aws-sdk-js/1.0.27 KiroIDE-{}-{}", kiro_version, machine_id);
 
@@ -109,6 +130,16 @@ impl KiroProvider {
         Ok(headers)
     }
 
+    async fn acquire_token_snapshot(
+        &self,
+    ) -> anyhow::Result<(String, crate::model::config::Config, KiroCredentials)> {
+        let mut tm = self.token_manager.lock().await;
+        let token = tm.ensure_valid_token().await?;
+        let config = tm.config().clone();
+        let credentials = tm.credentials().clone();
+        Ok((token, config, credentials))
+    }
+
     /// 发送非流式 API 请求
     ///
     /// # Arguments
@@ -117,12 +148,12 @@ impl KiroProvider {
     /// # Returns
     /// 返回原始的 HTTP Response，不做解析
     pub async fn call_api(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
-        let token = {
-            let mut tm = self.token_manager.lock().await;
-            tm.ensure_valid_token().await?
-        };
-        let url = self.base_url().await;
-        let headers = self.build_headers(&token).await?;
+        let (token, config, credentials) = self.acquire_token_snapshot().await?;
+        let url = format!(
+            "https://q.{}.amazonaws.com/generateAssistantResponse",
+            config.region
+        );
+        let headers = Self::build_headers(&token, &credentials, &config)?;
 
         let response = self
             .client
@@ -152,12 +183,12 @@ impl KiroProvider {
         &self,
         request_body: &str,
     ) -> anyhow::Result<reqwest::Response> {
-        let token = {
-            let mut tm = self.token_manager.lock().await;
-            tm.ensure_valid_token().await?
-        };
-        let url = self.base_url().await;
-        let headers = self.build_headers(&token).await?;
+        let (token, config, credentials) = self.acquire_token_snapshot().await?;
+        let url = format!(
+            "https://q.{}.amazonaws.com/generateAssistantResponse",
+            config.region
+        );
+        let headers = Self::build_headers(&token, &credentials, &config)?;
 
         let response = self
             .client

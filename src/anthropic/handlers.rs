@@ -89,26 +89,13 @@ pub async fn post_messages(
     // 获取 provider：优先从账号池获取，否则使用单账号模式
     let (provider, account_id, account_name, pool_ref) = if let Some(pool) = &state.account_pool {
         match pool.select_account().await {
-            Some((id, tm)) => {
-                // 获取账号名称
-                let acc_name = pool.list_accounts().await
-                    .iter()
-                    .find(|a| a.id == id)
-                    .map(|a| a.name.clone())
-                    .unwrap_or_else(|| "未知账号".to_string());
-                
-                // 从 TokenManager 创建临时 KiroProvider
-                let tm_guard = tm.lock().await;
-                let provider = crate::kiro::provider::KiroProvider::with_proxy(
-                    crate::kiro::token_manager::TokenManager::new(
-                        tm_guard.config().clone(),
-                        tm_guard.credentials().clone(),
-                        None, // TODO: 支持代理
-                    ),
-                    None,
-                );
-                drop(tm_guard);
-                (std::sync::Arc::new(provider), Some(id), acc_name, Some(pool.clone()))
+            Some(selected) => {
+                (
+                    selected.provider,
+                    Some(selected.id),
+                    selected.name,
+                    Some(pool.clone()),
+                )
             }
             None => {
                 tracing::error!("账号池中没有可用账号");
@@ -205,6 +192,13 @@ pub async fn post_messages(
     }
 }
 
+/// 流结束时的统计信息
+#[derive(Debug, Clone)]
+struct StreamStats {
+    output_tokens: i32,
+    input_tokens: i32,
+}
+
 /// 处理流式请求
 async fn handle_stream_request(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
@@ -264,22 +258,8 @@ async fn handle_stream_request(
         }
     };
 
-    // 记录成功的流式请求（输出 tokens 设为 -1 表示流式无法统计）
-    if let (Some(id), Some(pool)) = (&account_id, &pool) {
-        let log = crate::pool::RequestLog {
-            id: uuid::Uuid::new_v4().to_string(),
-            account_id: id.clone(),
-            account_name,
-            model: model.to_string(),
-            input_tokens,
-            output_tokens: -1, // 流式请求无法统计输出 tokens
-            success: true,
-            error: None,
-            timestamp: chrono::Utc::now(),
-            duration_ms: start_time.elapsed().as_millis() as u64,
-        };
-        pool.add_request_log(log).await;
-    }
+    // 创建 channel 用于在流结束时传递统计信息
+    let (stats_tx, stats_rx) = tokio::sync::oneshot::channel::<StreamStats>();
 
     // 创建流处理上下文
     let mut ctx = StreamContext::new_with_thinking(model, input_tokens, thinking_enabled);
@@ -287,8 +267,50 @@ async fn handle_stream_request(
     // 生成初始事件
     let initial_events = ctx.generate_initial_events();
 
-    // 创建 SSE 流
-    let stream = create_sse_stream(response, ctx, initial_events);
+    // 创建 SSE 流（传入 stats_tx）
+    let stream = create_sse_stream(response, ctx, initial_events, Some(stats_tx));
+
+    // 异步等待流结束并记录日志
+    if let (Some(id), Some(pool)) = (account_id, pool) {
+        let model = model.to_string();
+        tokio::spawn(async move {
+            match stats_rx.await {
+                Ok(stats) => {
+                    let log = crate::pool::RequestLog {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        account_id: id,
+                        account_name,
+                        model,
+                        input_tokens: stats.input_tokens,
+                        output_tokens: stats.output_tokens,
+                        success: true,
+                        error: None,
+                        timestamp: chrono::Utc::now(),
+                        duration_ms: start_time.elapsed().as_millis() as u64,
+                    };
+                    pool.add_request_log(log).await;
+                    tracing::debug!("流式请求完成，output_tokens: {}", stats.output_tokens);
+                }
+                Err(_) => {
+                    // channel 被关闭，可能是客户端断开连接
+                    let log = crate::pool::RequestLog {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        account_id: id,
+                        account_name,
+                        model,
+                        input_tokens,
+                        output_tokens: -1, // 未知
+                        success: true,
+                        error: Some("客户端可能提前断开".to_string()),
+                        timestamp: chrono::Utc::now(),
+                        duration_ms: start_time.elapsed().as_millis() as u64,
+                    };
+                    pool.add_request_log(log).await;
+                    tracing::warn!("流式请求统计 channel 关闭，可能客户端断开");
+                }
+            }
+        });
+    }
 
     // 返回 SSE 响应
     Response::builder()
@@ -313,6 +335,7 @@ fn create_sse_stream(
     response: reqwest::Response,
     ctx: StreamContext,
     initial_events: Vec<SseEvent>,
+    stats_tx: Option<tokio::sync::oneshot::Sender<StreamStats>>,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     // 先发送初始事件
     let initial_stream = stream::iter(
@@ -325,8 +348,8 @@ fn create_sse_stream(
     let body_stream = response.bytes_stream();
 
     let processing_stream = stream::unfold(
-        (body_stream, ctx, EventStreamDecoder::new(), false, interval(Duration::from_secs(PING_INTERVAL_SECS))),
-        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval)| async move {
+        (body_stream, ctx, EventStreamDecoder::new(), false, interval(Duration::from_secs(PING_INTERVAL_SECS)), stats_tx),
+        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, stats_tx)| async move {
             if finished {
                 return None;
             }
@@ -363,26 +386,46 @@ fn create_sse_stream(
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
 
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, stats_tx)))
                         }
                         Some(Err(e)) => {
                             tracing::error!("读取响应流失败: {}", e);
                             // 发送最终事件并结束
                             let final_events = ctx.generate_final_events();
+                            
+                            // 发送统计信息
+                            let final_input_tokens = ctx.context_input_tokens.unwrap_or(ctx.input_tokens);
+                            if let Some(tx) = stats_tx {
+                                let _ = tx.send(StreamStats {
+                                    output_tokens: ctx.output_tokens,
+                                    input_tokens: final_input_tokens,
+                                });
+                            }
+                            
                             let bytes: Vec<Result<Bytes, Infallible>> = final_events
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, None)))
                         }
                         None => {
                             // 流结束，发送最终事件
                             let final_events = ctx.generate_final_events();
+                            
+                            // 发送统计信息
+                            let final_input_tokens = ctx.context_input_tokens.unwrap_or(ctx.input_tokens);
+                            if let Some(tx) = stats_tx {
+                                let _ = tx.send(StreamStats {
+                                    output_tokens: ctx.output_tokens,
+                                    input_tokens: final_input_tokens,
+                                });
+                            }
+                            
                             let bytes: Vec<Result<Bytes, Infallible>> = final_events
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, None)))
                         }
                     }
                 }
@@ -390,7 +433,7 @@ fn create_sse_stream(
                 _ = ping_interval.tick() => {
                     tracing::trace!("发送 ping 保活事件");
                     let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval)))
+                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, stats_tx)))
                 }
             }
         },
