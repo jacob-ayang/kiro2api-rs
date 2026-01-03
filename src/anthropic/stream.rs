@@ -356,7 +356,11 @@ impl SseStateManager {
     }
 
     /// 生成最终事件序列
-    pub fn generate_final_events(&mut self, input_tokens: i32) -> Vec<SseEvent> {
+    pub fn generate_final_events(
+        &mut self,
+        input_tokens: i32,
+        output_tokens: i32,
+    ) -> Vec<SseEvent> {
         let mut events = Vec::new();
 
         // 关闭所有未关闭的块
@@ -386,7 +390,7 @@ impl SseStateManager {
                     },
                     "usage": {
                         "input_tokens": input_tokens,
-                        "output_tokens": 1
+                        "output_tokens": output_tokens.max(1)
                     }
                 }),
             ));
@@ -890,7 +894,10 @@ impl StreamContext {
         let final_input_tokens = self.context_input_tokens.unwrap_or(self.input_tokens);
 
         // 生成最终事件
-        events.extend(self.state_manager.generate_final_events(final_input_tokens));
+        events.extend(
+            self.state_manager
+                .generate_final_events(final_input_tokens, self.output_tokens),
+        );
         events
     }
 }
