@@ -34,6 +34,44 @@ pub fn map_model(model: &str) -> Option<String> {
     }
 }
 
+fn extract_text_only(content: &serde_json::Value) -> String {
+    match content {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Array(arr) => {
+            let mut text_parts = Vec::new();
+            for item in arr {
+                if let Ok(block) = serde_json::from_value::<ContentBlock>(item.clone()) {
+                    if block.block_type == "text" {
+                        if let Some(text) = block.text {
+                            text_parts.push(text);
+                        }
+                    }
+                }
+            }
+            text_parts.join("\n")
+        }
+        _ => String::new(),
+    }
+}
+
+fn is_context_compression_request(req: &MessagesRequest) -> bool {
+    let Some(last) = req.messages.last() else {
+        return false;
+    };
+    if last.role != "user" {
+        return false;
+    }
+
+    let text = extract_text_only(&last.content);
+    if text.is_empty() {
+        return false;
+    }
+
+    let lower = text.to_lowercase();
+    lower.contains("compress the conversation history")
+        || lower.contains("context compression system")
+}
+
 /// 转换结果
 #[derive(Debug)]
 pub struct ConversionResult {
@@ -61,14 +99,18 @@ impl std::error::Error for ConversionError {}
 
 /// 将 Anthropic 请求转换为 Kiro 请求
 pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, ConversionError> {
-    // 1. 映射模型
-    let model_id = map_model(&req.model)
-        .ok_or_else(|| ConversionError::UnsupportedModel(req.model.clone()))?;
-
-    // 2. 检查消息列表
+    // 1. 检查消息列表
     if req.messages.is_empty() {
         return Err(ConversionError::EmptyMessages);
     }
+
+    // 2. 识别是否为“上下文压缩”请求
+    let is_compression = is_context_compression_request(req);
+    let strip_tools = is_compression;
+
+    // 3. 映射模型
+    let model_id = map_model(&req.model)
+        .ok_or_else(|| ConversionError::UnsupportedModel(req.model.clone()))?;
 
     // 2.1 合并末尾连续的 user 消息（并行 tool_result 往往会拆成多个 user 消息）
     let mut current_start = req.messages.len();
@@ -76,17 +118,26 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
         current_start -= 1;
     }
     let current_user_messages = &req.messages[current_start..];
-    
+
     // 2.2 检查是否末尾是 assistant 消息（用于标题生成等场景）
-    let ends_with_assistant = current_user_messages.is_empty() 
-        && req.messages.last().map(|m| m.role == "assistant").unwrap_or(false);
+    let ends_with_assistant = current_user_messages.is_empty()
+        && req
+            .messages
+            .last()
+            .map(|m| m.role == "assistant")
+            .unwrap_or(false);
 
     // 3. 生成会话 ID 和代理 ID
     let conversation_id = Uuid::new_v4().to_string();
     let agent_continuation_id = Uuid::new_v4().to_string();
 
     // 4. 确定触发类型
-    let chat_trigger_type = determine_chat_trigger_type(req);
+    // 压缩请求不应触发工具调用
+    let chat_trigger_type = if strip_tools {
+        "MANUAL".to_string()
+    } else {
+        determine_chat_trigger_type(req)
+    };
 
     // 5. 处理末尾的 user 消息组作为 current_message
     let (text_content, images, tool_results) = if ends_with_assistant {
@@ -96,7 +147,7 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
         ("continue".to_string(), Vec::new(), Vec::new())
     } else {
         let current_refs: Vec<&super::types::Message> = current_user_messages.iter().collect();
-        let merged_current = merge_user_messages(&current_refs, &model_id)?;
+        let merged_current = merge_user_messages(&current_refs, &model_id, strip_tools)?;
         (
             merged_current.user_input_message.content.clone(),
             merged_current.user_input_message.images.clone(),
@@ -109,7 +160,12 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
     };
 
     // 6. 转换工具定义
-    let tools = convert_tools(&req.tools);
+    // 压缩请求场景下剥离 tools，避免上游对 tool_use/tool_result 做校验。
+    let tools = if strip_tools {
+        Vec::new()
+    } else {
+        convert_tools(&req.tools)
+    };
 
     // 7. 构建 UserInputMessageContext
     let mut context = UserInputMessageContext::new();
@@ -151,7 +207,7 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
         tool_choice: req.tool_choice.clone(),
         thinking: req.thinking.clone(),
     };
-    let history = build_history(&history_req, &model_id)?;
+    let history = build_history(&history_req, &model_id, strip_tools)?;
 
     // 10. 构建 ConversationState
     let conversation_state = ConversationState::new(conversation_id)
@@ -181,6 +237,7 @@ fn determine_chat_trigger_type(req: &MessagesRequest) -> String {
 /// 处理消息内容，提取文本、图片和工具结果
 fn process_message_content(
     content: &serde_json::Value,
+    strip_tools: bool,
 ) -> Result<(String, Vec<KiroImage>, Vec<ToolResult>), ConversionError> {
     let mut text_parts = Vec::new();
     let mut images = Vec::new();
@@ -210,6 +267,22 @@ fn process_message_content(
                             if let Some(tool_use_id) = block.tool_use_id {
                                 let result_content = extract_tool_result_content(&block.content);
                                 let is_error = block.is_error.unwrap_or(false);
+
+                                if strip_tools {
+                                    let status = if is_error { "error" } else { "success" };
+                                    if result_content.trim().is_empty() {
+                                        text_parts.push(format!(
+                                            "[tool_result:{}] id={}",
+                                            status, tool_use_id
+                                        ));
+                                    } else {
+                                        text_parts.push(format!(
+                                            "[tool_result:{}] id={}\n{}",
+                                            status, tool_use_id, result_content
+                                        ));
+                                    }
+                                    continue;
+                                }
 
                                 let mut result = if is_error {
                                     ToolResult::error(&tool_use_id, result_content)
@@ -316,7 +389,11 @@ fn has_thinking_tags(content: &str) -> bool {
 }
 
 /// 构建历史消息
-fn build_history(req: &MessagesRequest, model_id: &str) -> Result<Vec<Message>, ConversionError> {
+fn build_history(
+    req: &MessagesRequest,
+    model_id: &str,
+    strip_tools: bool,
+) -> Result<Vec<Message>, ConversionError> {
     let mut history = Vec::new();
 
     // 生成thinking前缀（如果需要）
@@ -386,12 +463,12 @@ fn build_history(req: &MessagesRequest, model_id: &str) -> Result<Vec<Message>, 
         } else if msg.role == "assistant" {
             // 遇到 assistant，处理累积的 user 消息
             if !user_buffer.is_empty() {
-                let merged_user = merge_user_messages(&user_buffer, model_id)?;
+                let merged_user = merge_user_messages(&user_buffer, model_id, strip_tools)?;
                 history.push(Message::User(merged_user));
                 user_buffer.clear();
 
                 // 添加 assistant 消息
-                let assistant = convert_assistant_message(msg)?;
+                let assistant = convert_assistant_message(msg, strip_tools)?;
                 history.push(Message::Assistant(assistant));
             }
         }
@@ -399,7 +476,7 @@ fn build_history(req: &MessagesRequest, model_id: &str) -> Result<Vec<Message>, 
 
     // 处理结尾的孤立 user 消息
     if !user_buffer.is_empty() {
-        let merged_user = merge_user_messages(&user_buffer, model_id)?;
+        let merged_user = merge_user_messages(&user_buffer, model_id, strip_tools)?;
         history.push(Message::User(merged_user));
 
         // 自动配对一个 "OK" 的 assistant 响应
@@ -414,13 +491,14 @@ fn build_history(req: &MessagesRequest, model_id: &str) -> Result<Vec<Message>, 
 fn merge_user_messages(
     messages: &[&super::types::Message],
     model_id: &str,
+    strip_tools: bool,
 ) -> Result<HistoryUserMessage, ConversionError> {
     let mut content_parts = Vec::new();
     let mut all_images = Vec::new();
     let mut all_tool_results = Vec::new();
 
     for msg in messages {
-        let (text, images, tool_results) = process_message_content(&msg.content)?;
+        let (text, images, tool_results) = process_message_content(&msg.content, strip_tools)?;
         if !text.is_empty() {
             content_parts.push(text);
         }
@@ -450,10 +528,12 @@ fn merge_user_messages(
 /// 转换 assistant 消息
 fn convert_assistant_message(
     msg: &super::types::Message,
+    strip_tools: bool,
 ) -> Result<HistoryAssistantMessage, ConversionError> {
     let mut thinking_content = String::new();
     let mut text_content = String::new();
     let mut tool_uses = Vec::new();
+    let mut tool_use_text_parts: Vec<String> = Vec::new();
 
     match &msg.content {
         serde_json::Value::String(s) => {
@@ -483,7 +563,27 @@ fn convert_assistant_message(
 
                             if let (Some(id), Some(name)) = (block.id, block.name) {
                                 let input = block.input.unwrap_or(serde_json::json!({}));
-                                tool_uses.push(ToolUseEntry::new(id, name).with_input(input));
+
+                                if strip_tools {
+                                    let input_text =
+                                        if input.is_null() || input == serde_json::json!({}) {
+                                            String::new()
+                                        } else {
+                                            input.to_string()
+                                        };
+
+                                    if input_text.is_empty() {
+                                        tool_use_text_parts
+                                            .push(format!("[tool_use] id={} name={}", id, name));
+                                    } else {
+                                        tool_use_text_parts.push(format!(
+                                            "[tool_use] id={} name={}\ninput: {}",
+                                            id, name, input_text
+                                        ));
+                                    }
+                                } else {
+                                    tool_uses.push(ToolUseEntry::new(id, name).with_input(input));
+                                }
                             }
                         }
                         _ => {}
@@ -492,6 +592,13 @@ fn convert_assistant_message(
             }
         }
         _ => {}
+    }
+
+    if strip_tools && !tool_use_text_parts.is_empty() {
+        if !text_content.is_empty() {
+            text_content.push('\n');
+        }
+        text_content.push_str(&tool_use_text_parts.join("\n"));
     }
 
     // 组合 thinking 和 text 内容
