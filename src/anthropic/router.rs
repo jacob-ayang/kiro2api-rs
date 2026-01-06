@@ -11,10 +11,9 @@ use crate::kiro::provider::KiroProvider;
 use crate::pool::AccountPool;
 
 use super::{
-    handlers::{count_tokens, get_models, post_messages},
+    handlers::{count_tokens, get_models, openai_chat_completions, post_messages},
     middleware::{auth_middleware, cors_layer, AppState},
 };
-
 /// 创建 Anthropic API 路由
 ///
 /// # 端点
@@ -50,6 +49,8 @@ pub fn create_router_with_provider(
         .route("/models", get(get_models))
         .route("/messages", post(post_messages))
         .route("/messages/count_tokens", post(count_tokens))
+        // OpenAI 格式请求拦截
+        .route("/chat/completions", post(openai_chat_completions))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
@@ -70,6 +71,8 @@ pub fn create_router_with_pool(api_key: impl Into<String>, pool: Arc<AccountPool
         .route("/models", get(get_models))
         .route("/messages", post(post_messages))
         .route("/messages/count_tokens", post(count_tokens))
+        // OpenAI 格式请求拦截
+        .route("/chat/completions", post(openai_chat_completions))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,

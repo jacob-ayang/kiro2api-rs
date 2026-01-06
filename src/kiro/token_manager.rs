@@ -61,6 +61,19 @@ impl TokenManager {
             .clone()
             .ok_or_else(|| anyhow::anyhow!("没有可用的 accessToken"))
     }
+
+    /// 强制刷新访问 Token（不依赖 expiresAt 判断）
+    pub async fn force_refresh(&mut self) -> anyhow::Result<()> {
+        self.credentials =
+            refresh_token(&self.credentials, &self.config, self.proxy.as_ref()).await?;
+
+        // 刷新后再次检查 token 时间有效性
+        if is_token_expired(&self.credentials) {
+            anyhow::bail!("刷新后的 Token 仍然无效或已过期");
+        }
+
+        Ok(())
+    }
 }
 
 /// 检查 Token 是否在指定时间内过期

@@ -4,8 +4,9 @@
 //! 支持流式和非流式请求
 
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONNECTION, CONTENT_TYPE, HOST};
-use reqwest::Client;
+use reqwest::{Client, StatusCode};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
@@ -21,6 +22,31 @@ use crate::kiro::token_manager::TokenManager;
 pub struct KiroProvider {
     token_manager: Arc<Mutex<TokenManager>>,
     client: Client,
+}
+
+const KIRO_MAX_ATTEMPTS: usize = 3;
+const KIRO_RETRY_BASE_DELAY_MS: u64 = 200;
+const KIRO_RETRY_MAX_DELAY_MS: u64 = 2_000;
+
+fn retry_backoff(attempt: usize) -> Duration {
+    let exp = 1u64 << (attempt.saturating_sub(1).min(10) as u32);
+    let base = KIRO_RETRY_BASE_DELAY_MS
+        .saturating_mul(exp)
+        .min(KIRO_RETRY_MAX_DELAY_MS);
+    let jitter = fastrand::u64(0..=(base / 4).max(1));
+    Duration::from_millis(base + jitter)
+}
+
+fn is_retryable_status(status: StatusCode) -> bool {
+    status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
+}
+
+fn is_auth_status(status: StatusCode) -> bool {
+    status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN
+}
+
+fn is_retryable_reqwest_error(err: &reqwest::Error) -> bool {
+    err.is_timeout() || err.is_connect()
 }
 
 impl KiroProvider {
@@ -151,28 +177,7 @@ impl KiroProvider {
     /// # Returns
     /// 返回原始的 HTTP Response，不做解析
     pub async fn call_api(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
-        let (token, config, credentials) = self.acquire_token_snapshot().await?;
-        let url = format!(
-            "https://q.{}.amazonaws.com/generateAssistantResponse",
-            config.region
-        );
-        let headers = Self::build_headers(&token, &credentials, &config)?;
-
-        let response = self
-            .client
-            .post(&url)
-            .headers(headers)
-            .body(request_body.to_string())
-            .send()
-            .await?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            anyhow::bail!("API 请求失败: {} {}", status, body);
-        }
-
-        Ok(response)
+        self.call_api_with_retry(request_body, false).await
     }
 
     /// 发送流式 API 请求
@@ -183,28 +188,92 @@ impl KiroProvider {
     /// # Returns
     /// 返回原始的 HTTP Response，调用方负责处理流式数据
     pub async fn call_api_stream(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
-        let (token, config, credentials) = self.acquire_token_snapshot().await?;
-        let url = format!(
-            "https://q.{}.amazonaws.com/generateAssistantResponse",
-            config.region
-        );
-        let headers = Self::build_headers(&token, &credentials, &config)?;
+        self.call_api_with_retry(request_body, true).await
+    }
 
-        let response = self
-            .client
-            .post(&url)
-            .headers(headers)
-            .body(request_body.to_string())
-            .send()
-            .await?;
+    async fn call_api_with_retry(
+        &self,
+        request_body: &str,
+        streaming: bool,
+    ) -> anyhow::Result<reqwest::Response> {
+        let body = request_body.to_string();
+        let kind = if streaming { "流式" } else { "非流式" };
+        let mut forced_refresh = false;
 
-        if !response.status().is_success() {
+        for attempt in 1..=KIRO_MAX_ATTEMPTS {
+            let (token, config, credentials) = self.acquire_token_snapshot().await?;
+            let url = format!(
+                "https://q.{}.amazonaws.com/generateAssistantResponse",
+                config.region
+            );
+            let headers = Self::build_headers(&token, &credentials, &config)?;
+
+            let response = match self
+                .client
+                .post(&url)
+                .headers(headers)
+                .body(body.clone())
+                .send()
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    if attempt < KIRO_MAX_ATTEMPTS && is_retryable_reqwest_error(&e) {
+                        let delay = retry_backoff(attempt);
+                        tracing::warn!(
+                            "Kiro {} API 请求发送失败: {}，{:?} 后重试（{}/{}）",
+                            kind,
+                            e,
+                            delay,
+                            attempt,
+                            KIRO_MAX_ATTEMPTS
+                        );
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    }
+                    return Err(e.into());
+                }
+            };
+
             let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            anyhow::bail!("流式 API 请求失败: {} {}", status, body);
+            if status.is_success() {
+                return Ok(response);
+            }
+
+            let body_text = response.text().await.unwrap_or_default();
+
+            if attempt < KIRO_MAX_ATTEMPTS && is_auth_status(status) && !forced_refresh {
+                forced_refresh = true;
+                tracing::warn!(
+                    "{} API 返回 {}，将强制刷新 Token 后重试（{}/{}）",
+                    kind,
+                    status,
+                    attempt,
+                    KIRO_MAX_ATTEMPTS
+                );
+                let mut tm = self.token_manager.lock().await;
+                tm.force_refresh().await?;
+                continue;
+            }
+
+            if attempt < KIRO_MAX_ATTEMPTS && is_retryable_status(status) {
+                let delay = retry_backoff(attempt);
+                tracing::warn!(
+                    "{} API 返回 {}，{:?} 后重试（{}/{}）",
+                    kind,
+                    status,
+                    delay,
+                    attempt,
+                    KIRO_MAX_ATTEMPTS
+                );
+                tokio::time::sleep(delay).await;
+                continue;
+            }
+
+            anyhow::bail!("{} API 请求失败: {} {}", kind, status, body_text);
         }
 
-        Ok(response)
+        unreachable!("attempt loop should return")
     }
 }
 

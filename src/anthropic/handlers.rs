@@ -27,6 +27,21 @@ use super::types::{
     CountTokensRequest, CountTokensResponse, ErrorResponse, MessagesRequest, Model, ModelsResponse,
 };
 
+/// POST /v1/chat/completions
+///
+/// OpenAI 格式请求拦截 - 返回错误提示
+pub async fn openai_chat_completions() -> impl IntoResponse {
+    tracing::warn!("Received OpenAI format request: POST /v1/chat/completions");
+    
+    (
+        StatusCode::BAD_REQUEST,
+        Json(ErrorResponse::new(
+            "invalid_request_error",
+            "This is an Anthropic API, not OpenAI API. Please use POST /v1/messages instead of /v1/chat/completions. For more information, see: https://docs.anthropic.com/en/api/messages".to_string(),
+        )),
+    )
+}
+
 /// GET /v1/models
 ///
 /// 返回可用的模型列表
